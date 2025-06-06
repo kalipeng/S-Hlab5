@@ -1,0 +1,380 @@
+/* Edge-Cloud Offloading Magic Wand
+ * TECHIN515 Lab 5 - Kelly Peng
+ * 
+ * This implementation performs local gesture recognition and offloads
+ * to cloud when local confidence is below threshold
+ */
+
+/* Includes ---------------------------------------------------------------- */
+#include <kellypeng-project-1_inferencing.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// WiFi credentials - UPDATE THESE
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Server URL - UPDATE THIS to your web app URL
+const char* serverUrl = "http://localhost:5000/predict";
+
+// Confidence threshold for cloud offloading
+#define CONFIDENCE_THRESHOLD 80.0
+
+// LED pins for gesture indication
+#define LED_RED_PIN 5
+#define LED_GREEN_PIN 18
+#define LED_BLUE_PIN 19
+
+// MPU6050 sensor
+Adafruit_MPU6050 mpu;
+
+// Button pin definition
+#define BUTTON_PIN 2
+#define BUTTON_DEBOUNCE_MS 50
+
+// Sampling and capture variables
+#define SAMPLE_RATE_MS 10
+#define CAPTURE_DURATION_MS 1000
+#define FEATURE_SIZE EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE
+
+// Capture state variables
+bool capturing = false;
+unsigned long last_sample_time = 0;
+unsigned long capture_start_time = 0;
+int sample_count = 0;
+
+// Button state variables
+bool last_button_state = HIGH;
+bool button_state = HIGH;
+unsigned long last_debounce_time = 0;
+
+// Feature array to store accelerometer data
+float features[FEATURE_SIZE];
+
+/**
+ * @brief      Copy raw feature data in out_ptr
+ */
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+    memcpy(out_ptr, features + offset, length * sizeof(float));
+    return 0;
+}
+
+/**
+ * @brief      Setup WiFi connection
+ */
+void setup_wifi() {
+    delay(10);
+    Serial.println();
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+    
+    WiFi.begin(ssid, password);
+    
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    Serial.println("");
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+}
+
+/**
+ * @brief      Setup LED pins
+ */
+void setup_leds() {
+    pinMode(LED_RED_PIN, OUTPUT);
+    pinMode(LED_GREEN_PIN, OUTPUT);
+    pinMode(LED_BLUE_PIN, OUTPUT);
+    
+    // Turn off all LEDs initially
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    digitalWrite(LED_BLUE_PIN, LOW);
+}
+
+/**
+ * @brief      Control LED based on gesture
+ */
+void actuate_led(const char* gesture, float confidence) {
+    // Turn off all LEDs first
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    digitalWrite(LED_BLUE_PIN, LOW);
+    
+    // Light up LED based on gesture
+    if (strcmp(gesture, "O") == 0) {
+        digitalWrite(LED_RED_PIN, HIGH);
+        Serial.println("LED: Red (O gesture)");
+    } else if (strcmp(gesture, "V") == 0) {
+        digitalWrite(LED_GREEN_PIN, HIGH);
+        Serial.println("LED: Green (V gesture)");
+    } else if (strcmp(gesture, "Z") == 0) {
+        digitalWrite(LED_BLUE_PIN, HIGH);
+        Serial.println("LED: Blue (Z gesture)");
+    } else {
+        // Unknown gesture - blink all LEDs
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(LED_RED_PIN, HIGH);
+            digitalWrite(LED_GREEN_PIN, HIGH);
+            digitalWrite(LED_BLUE_PIN, HIGH);
+            delay(200);
+            digitalWrite(LED_RED_PIN, LOW);
+            digitalWrite(LED_GREEN_PIN, LOW);
+            digitalWrite(LED_BLUE_PIN, LOW);
+            delay(200);
+        }
+        Serial.println("LED: Blink (Unknown gesture)");
+    }
+}
+
+/**
+ * @brief      Send raw sensor data to cloud server
+ */
+void sendRawDataToServer() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected - cannot send to server");
+        return;
+    }
+    
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    
+    // Build JSON array from features[]
+    String jsonPayload = "{\"features\":[";
+    for (int i = 0; i < FEATURE_SIZE; i++) {
+        jsonPayload += String(features[i], 6);
+        if (i < FEATURE_SIZE - 1) {
+            jsonPayload += ",";
+        }
+    }
+    jsonPayload += "]}";
+    
+    Serial.println("Sending data to server...");
+    Serial.println("Payload size: " + String(jsonPayload.length()) + " bytes");
+    
+    int httpResponseCode = http.POST(jsonPayload);
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+    
+    if (httpResponseCode > 0) {
+        String response = http.getString();
+        Serial.println("Server response: " + response);
+        
+        // Parse the JSON response
+        DynamicJsonDocument doc(256);
+        DeserializationError error = deserializeJson(doc, response);
+        if (!error) {
+            const char* gesture = doc["gesture"];
+            float confidence = doc["confidence"];
+            
+            Serial.println("=== SERVER INFERENCE RESULT ===");
+            Serial.print("Gesture: ");
+            Serial.println(gesture);
+            Serial.print("Confidence: ");
+            Serial.print(confidence);
+            Serial.println("%");
+            Serial.println("===============================");
+            
+            // Actuate LED based on server result
+            actuate_led(gesture, confidence);
+        } else {
+            Serial.print("Failed to parse server response: ");
+            Serial.println(error.c_str());
+        }
+    } else {
+        Serial.printf("Error sending POST: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+    
+    http.end();
+}
+
+/**
+ * @brief      Arduino setup function
+ */
+void setup() {
+    // Initialize serial
+    Serial.begin(115200);
+    while (!Serial) delay(10);
+    
+    Serial.println("=== TECHIN515 Lab 5: Edge-Cloud Offloading ===");
+    
+    // Setup LEDs
+    setup_leds();
+    
+    // Setup WiFi
+    setup_wifi();
+    
+    // Initialize button pin
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    
+    // Test button
+    Serial.println("Button test - Press the button to continue...");
+    while (digitalRead(BUTTON_PIN) == HIGH) {
+        delay(10);
+    }
+    Serial.println("Button working!");
+    delay(1000);
+    
+    // Initialize MPU6050
+    Serial.println("Initializing MPU6050...");
+    if (!mpu.begin()) {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1) {
+            delay(10);
+        }
+    }
+    
+    // Configure MPU6050
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    
+    Serial.println("MPU6050 initialized successfully");
+    Serial.println("Confidence threshold: " + String(CONFIDENCE_THRESHOLD) + "%");
+    Serial.println("Press button to start gesture capture");
+}
+
+/**
+ * @brief      Read button state with debouncing
+ */
+bool read_button() {
+    bool reading = digitalRead(BUTTON_PIN);
+    
+    if (reading != last_button_state) {
+        last_debounce_time = millis();
+    }
+    
+    if ((millis() - last_debounce_time) > BUTTON_DEBOUNCE_MS) {
+        if (reading != button_state) {
+            button_state = reading;
+            if (button_state == LOW) {
+                return true;
+            }
+        }
+    }
+    
+    last_button_state = reading;
+    return false;
+}
+
+/**
+ * @brief      Capture accelerometer data for inference
+ */
+void capture_accelerometer_data() {
+    if (millis() - last_sample_time >= SAMPLE_RATE_MS) {
+        last_sample_time = millis();
+        
+        // Get accelerometer data
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+        
+        // Store data in features array
+        if (sample_count < FEATURE_SIZE / 3) {
+            int idx = sample_count * 3;
+            features[idx] = a.acceleration.x;
+            features[idx + 1] = a.acceleration.y;
+            features[idx + 2] = a.acceleration.z;
+            sample_count++;
+        }
+        
+        // Check if capture duration has elapsed
+        if (millis() - capture_start_time >= CAPTURE_DURATION_MS) {
+            capturing = false;
+            Serial.println("Capture complete - Running inference...");
+            
+            // Run local inference first
+            run_inference();
+        }
+    }
+}
+
+/**
+ * @brief      Run local inference and decide whether to offload
+ */
+void run_inference() {
+    // Check if we have enough data
+    if (sample_count * 3 < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+        Serial.println("ERROR: Not enough data for inference");
+        return;
+    }
+    
+    ei_impulse_result_t result = { 0 };
+    
+    // Create signal from features array
+    signal_t features_signal;
+    features_signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
+    features_signal.get_data = &raw_feature_get_data;
+    
+    // Run the local classifier
+    EI_IMPULSE_ERROR res = run_classifier(&features_signal, &result, false);
+    if (res != EI_IMPULSE_OK) {
+        Serial.print("ERR: Failed to run classifier (");
+        Serial.print(res);
+        Serial.println(")");
+        return;
+    }
+    
+    // Find the prediction with highest confidence
+    float max_confidence = 0;
+    int max_index = -1;
+    
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (result.classification[i].value > max_confidence) {
+            max_confidence = result.classification[i].value;
+            max_index = i;
+        }
+    }
+    
+    float confidence_percent = max_confidence * 100;
+    
+    Serial.println("=== LOCAL INFERENCE RESULT ===");
+    if (max_index != -1) {
+        Serial.print("Gesture: ");
+        Serial.println(ei_classifier_inferencing_categories[max_index]);
+        Serial.print("Confidence: ");
+        Serial.print(confidence_percent);
+        Serial.println("%");
+    }
+    Serial.println("==============================");
+    
+    // Decide whether to use local result or offload to cloud
+    if (confidence_percent < CONFIDENCE_THRESHOLD) {
+        Serial.println("Low confidence - sending raw data to server...");
+        sendRawDataToServer();
+    } else {
+        Serial.println("High confidence - using local inference result");
+        if (max_index != -1) {
+            actuate_led(ei_classifier_inferencing_categories[max_index], confidence_percent);
+        }
+    }
+}
+
+/**
+ * @brief      Arduino main loop
+ */
+void loop() {
+    // Check for button press
+    if (read_button() && !capturing) {
+        Serial.println("\n=== Starting gesture capture ===");
+        sample_count = 0;
+        capturing = true;
+        capture_start_time = millis();
+        last_sample_time = millis();
+    }
+    
+    // Capture data if in capturing mode
+    if (capturing) {
+        capture_accelerometer_data();
+    }
+    
+    // Small delay to prevent overwhelming the loop
+    delay(1);
+}
